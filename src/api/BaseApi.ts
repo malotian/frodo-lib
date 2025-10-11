@@ -87,8 +87,36 @@ function createAxiosInstance(
   state: State,
   requestConfig: AxiosRequestConfig
 ): AxiosInstance {
-  const axiosInstance = axios.create(requestConfig);
 
+  // Extract "x-IDaaS-ProxyConnect" header from environment variable as "key:value" string
+  let proxyConnectHeader = {};
+  if (process.env.FRODO_PROXY_CONNECT) {
+    const [key, value] = process.env.FRODO_PROXY_CONNECT.split(':');
+    if (key && value) {
+      proxyConnectHeader = { [key]: value };
+    }
+  }
+
+  const requestConfigEx = mergeDeep({ headers: proxyConnectHeader }, requestConfig);
+  const axiosInstance = axios.create(requestConfigEx);
+
+  axiosInstance.interceptors.request.use((config) => {
+    // Add any request-specific logic here
+    return config;
+  });
+
+  axiosInstance.interceptors.response.use(
+    (response) => {
+      // Add any response-specific logic here
+      return response;
+    },
+    (error) => {
+      // Add any error-specific logic here
+      return Promise.reject(error);
+    }
+  );
+
+  return axiosInstance;
   const globalRetryConfig = state.getAxiosRetryConfig();
   const requestRetryConfig = requestConfig['axios-retry'];
   if (!!globalRetryConfig || !!requestRetryConfig) {
