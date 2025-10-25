@@ -1,10 +1,11 @@
-import { getScript, type ScriptSkeleton } from '../api/ScriptApi';
+import { type ScriptSkeleton } from '../api/ScriptApi';
 import {
   deleteProviderByTypeAndId,
   getSocialIdentityProviders as _getSocialIdentityProviders,
   putProviderByTypeAndId as _putProviderByTypeAndId,
   type SocialIdpSkeleton,
 } from '../api/SocialIdentityProvidersApi';
+import Constants from '../shared/Constants';
 import { State } from '../shared/State';
 import {
   createProgressIndicator,
@@ -18,9 +19,10 @@ import {
   convertTextArrayToBase64,
   getMetadata,
 } from '../utils/ExportImportUtils';
+import { getCurrentRealmName } from '../utils/ForgeRockUtils';
 import { FrodoError } from './FrodoError';
 import { type ExportMetaData } from './OpsTypes';
-import { updateScript } from './ScriptOps';
+import { readScript, updateScript } from './ScriptOps';
 
 export type Idp = {
   /**
@@ -420,7 +422,24 @@ export async function readSocialIdentityProviders({
     const { result } = await _getSocialIdentityProviders({ state });
     return result;
   } catch (error) {
-    throw new FrodoError(`Error reading providers`, error);
+    if (
+      // service accounts don't have access to social idps in root realm in AIC
+      (state.getDeploymentType() === Constants.CLOUD_DEPLOYMENT_TYPE_KEY &&
+        error.response?.status === 403 &&
+        state.getUseBearerTokenForAmApis() &&
+        getCurrentRealmName(state) === '/') ||
+      // hm... not sure if this clause ever tiggers
+      (error.response?.status === 403 &&
+        error.response?.data?.message ===
+          'This operation is not available in PingOne Advanced Identity Cloud.')
+    ) {
+      return [];
+    } else {
+      throw new FrodoError(
+        `Error reading ${getCurrentRealmName(state) + ' realm'} providers`,
+        error
+      );
+    }
   }
 }
 
@@ -450,7 +469,10 @@ export async function readSocialIdentityProvider({
         throw new FrodoError(`Multiple providers found`);
     }
   } catch (error) {
-    throw new FrodoError(`Error reading provider ${providerId}`, error);
+    throw new FrodoError(
+      `Error reading ${getCurrentRealmName(state) + ' realm'} provider ${providerId}`,
+      error
+    );
   }
 }
 
@@ -458,22 +480,25 @@ export async function createSocialIdentityProvider({
   providerType,
   providerId,
   providerData,
+  errorIfExists = true,
   state,
 }: {
   providerType: string;
   providerId: string;
   providerData: SocialIdpSkeleton;
+  errorIfExists?: boolean;
   state: State;
 }): Promise<SocialIdpSkeleton> {
   debugMessage({
     message: `IdpOps.createSocialIdentityProvider: start`,
     state,
   });
+  let result: SocialIdpSkeleton;
   try {
-    await readSocialIdentityProvider({ providerId, state });
+    result = await readSocialIdentityProvider({ providerId, state });
   } catch (error) {
     try {
-      const result = await updateSocialIdentityProvider({
+      result = await updateSocialIdentityProvider({
         providerType,
         providerId,
         providerData,
@@ -485,10 +510,18 @@ export async function createSocialIdentityProvider({
       });
       return result;
     } catch (error) {
-      throw new FrodoError(`Error creating provider ${providerId}`, error);
+      throw new FrodoError(
+        `Error creating ${getCurrentRealmName(state) + ' realm'} provider ${providerId}`,
+        error
+      );
     }
   }
-  throw new FrodoError(`Provider ${providerId} already exists`);
+  if (errorIfExists) {
+    throw new FrodoError(
+      `${getCurrentRealmName(state) + ' realm'} provider ${providerId} already exists`
+    );
+  }
+  return result;
 }
 
 export async function updateSocialIdentityProvider({
@@ -520,11 +553,26 @@ export async function updateSocialIdentityProvider({
     return response;
   } catch (error) {
     if (
+      error.response?.status === 500 &&
+      error.response?.data?.message ===
+        'Unable to update SMS config: Data validation failed for the attribute, Redirect after form post URL'
+    ) {
+      providerData['redirectAfterFormPostURI'] = '';
+      try {
+        await _putProviderByTypeAndId({
+          type: providerType,
+          id: providerId,
+          providerData,
+          state,
+        });
+      } catch (importError2) {
+        throw new FrodoError(`Error updating provider ${providerId}`, error);
+      }
+    } else if (
       error.response?.status === 400 &&
       error.response?.data?.message === 'Invalid attribute specified.'
     ) {
       const { validAttributes } = error.response.data.detail;
-      validAttributes.push('_id', '_type');
       for (const attribute of Object.keys(providerData)) {
         if (!validAttributes.includes(attribute)) {
           if (state.getVerbose())
@@ -539,20 +587,27 @@ export async function updateSocialIdentityProvider({
       }
       if (state.getVerbose())
         printMessage({ message: '\n', type: 'warn', newline: false, state });
-      const response = await _putProviderByTypeAndId({
-        type: providerType,
-        id: providerId,
-        providerData,
-        state,
-      });
-      debugMessage({
-        message: `IdpOps.updateSocialIdentityProvider: end (after retry)`,
-        state,
-      });
-      return response;
+      try {
+        const response = await _putProviderByTypeAndId({
+          type: providerType,
+          id: providerId,
+          providerData,
+          state,
+        });
+        debugMessage({
+          message: `IdpOps.updateSocialIdentityProvider: end (after retry)`,
+          state,
+        });
+        return response;
+      } catch (importError2) {
+        throw new FrodoError(`Error updating provider ${providerId}`, error);
+      }
     } else {
       // unhandleable error
-      throw new FrodoError(`Error updating provider ${providerId}`, error);
+      throw new FrodoError(
+        `Error updating ${getCurrentRealmName(state) + ' realm'} provider ${providerId}`,
+        error
+      );
     }
   }
 }
@@ -603,7 +658,10 @@ export async function deleteSocialIdentityProviders({
     if (errors.length > 0) {
       throw error;
     }
-    throw new FrodoError(`Error deleting providers`, error);
+    throw new FrodoError(
+      `Error deleting ${getCurrentRealmName(state) + ' realm'} providers`,
+      error
+    );
   }
 }
 
@@ -637,7 +695,10 @@ export async function deleteSocialIdentityProvider({
         throw new Error(`Multiple providers found`);
     }
   } catch (error) {
-    throw new FrodoError(`Error deleting provider ${providerId}`, error);
+    throw new FrodoError(
+      `Error deleting ${getCurrentRealmName(state) + ' realm'} provider ${providerId}`,
+      error
+    );
   }
 }
 
@@ -660,7 +721,7 @@ export async function exportSocialIdentityProvider({
     exportData.idp[idpData._id] = idpData;
     if (idpData.transform) {
       try {
-        const scriptData = await getScript({
+        const scriptData = await readScript({
           scriptId: idpData.transform,
           state,
         });
@@ -669,13 +730,18 @@ export async function exportSocialIdentityProvider({
         );
         exportData.script[idpData.transform] = scriptData;
       } catch (error) {
-        throw new FrodoError(`Error reading script ${idpData.transform}`);
+        throw new FrodoError(
+          `Error reading ${getCurrentRealmName(state) + ' realm'} script ${idpData.transform}`
+        );
       }
     }
     debugMessage({ message: `IdpOps.exportSocialProvider: end`, state });
     return exportData;
   } catch (error) {
-    throw new FrodoError(`Error exporting provider ${providerId}`, error);
+    throw new FrodoError(
+      `Error exporting ${getCurrentRealmName(state) + ' realm'} provider ${providerId}`,
+      error
+    );
   }
 }
 
@@ -697,19 +763,19 @@ export async function exportSocialIdentityProviders({
     const allIdpsData = await readSocialIdentityProviders({ state });
     indicatorId = createProgressIndicator({
       total: allIdpsData.length,
-      message: 'Exporting providers',
+      message: `Exporting ${getCurrentRealmName(state) + ' realm'} providers`,
       state,
     });
     for (const idpData of allIdpsData) {
       try {
         updateProgressIndicator({
           id: indicatorId,
-          message: `Exporting provider ${idpData._id}`,
+          message: `Exporting ${getCurrentRealmName(state) + ' realm'} provider ${idpData._id}`,
           state,
         });
         exportData.idp[idpData._id] = idpData;
         if (options.deps && idpData.transform) {
-          const scriptData = await getScript({
+          const scriptData = await readScript({
             scriptId: idpData.transform,
             state,
           });
@@ -725,22 +791,28 @@ export async function exportSocialIdentityProviders({
       }
     }
     if (errors.length > 0) {
-      throw new FrodoError(`Error exporting dependencies`, errors);
+      throw new FrodoError(
+        `Error exporting ${getCurrentRealmName(state) + ' realm'} dependencies`,
+        errors
+      );
     }
     stopProgressIndicator({
       id: indicatorId,
-      message: `${allIdpsData.length} providers exported.`,
+      message: `${allIdpsData.length} ${getCurrentRealmName(state) + ' realm'} providers exported.`,
       state,
     });
     return exportData;
   } catch (error) {
     stopProgressIndicator({
       id: indicatorId,
-      message: `Error exporting providers`,
+      message: `Error exporting ${getCurrentRealmName(state) + ' realm'} providers`,
       status: 'fail',
       state,
     });
-    throw new FrodoError(`Error exporting providers`, error);
+    throw new FrodoError(
+      `Error exporting ${getCurrentRealmName(state) + ' realm'} providers`,
+      error
+    );
   }
 }
 
@@ -795,10 +867,15 @@ export async function importSocialIdentityProvider({
     }
   }
   if (errors.length > 0) {
-    throw new FrodoError(`Error importing provider ${providerId}`, errors);
+    throw new FrodoError(
+      `Error importing ${getCurrentRealmName(state) + ' realm'} provider ${providerId}`,
+      errors
+    );
   }
   if (0 === imported.length) {
-    throw new FrodoError(`Provider ${providerId} not found in import data`);
+    throw new FrodoError(
+      `${getCurrentRealmName(state) + ' realm'} provider ${providerId} not found in import data`
+    );
   }
   return response;
 }
@@ -850,7 +927,10 @@ export async function importFirstSocialIdentityProvider({
     break;
   }
   if (errors.length > 0) {
-    throw new FrodoError(`Error importing first provider`, errors);
+    throw new FrodoError(
+      `Error importing first ${getCurrentRealmName(state) + ' realm'} provider`,
+      errors
+    );
   }
   if (0 === imported.length) {
     throw new FrodoError(`No providers found in import data`);
@@ -908,7 +988,10 @@ export async function importSocialIdentityProviders({
     }
   }
   if (errors.length > 0) {
-    throw new FrodoError(`Error importing providers`, errors);
+    throw new FrodoError(
+      `Error importing ${getCurrentRealmName(state) + ' realm'} providers`,
+      errors
+    );
   }
   return response;
 }
